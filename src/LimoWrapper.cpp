@@ -29,7 +29,6 @@ namespace ros2wrap {
             std::string body_frame;
 
             bool publish_tf;
-            bool tf_stamp_with_now;
 
         private:
                 // subscribers
@@ -71,10 +70,6 @@ namespace ros2wrap {
 
                     rclcpp::Parameter tf_pub = this->get_parameter("frames.tf_pub");
                     this->publish_tf = tf_pub.as_bool();
-
-                    // If true (default): TF stamp = now() — avoids stale-stamp warnings on live robot.
-                    // Set false for bag replay: stamp = sensor time so TF aligns with cloud timestamps.
-                    this->tf_stamp_with_now = this->declare_parameter("frames.tf_stamp_with_now", true);
 
                     // Define two callback groups (ensure parallel execution of lidar_callback & imu_callback)
                     rclcpp::SubscriptionOptions lidar_opt, imu_opt;
@@ -184,7 +179,7 @@ namespace ros2wrap {
 
                 // TF broadcasting
                 if(this->publish_tf)
-                    this->broadcastTF(loc.getWorldState(), world_frame, body_frame, this->tf_stamp_with_now);
+                    this->broadcastTF(loc.getWorldState(), world_frame, body_frame, true);
             }
 
         /* ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
@@ -353,7 +348,8 @@ namespace ros2wrap {
 
             void fromLimoToROS(const fast_limo::State& in, nav_msgs::msg::Odometry& out){
                 out.header.stamp = this->get_clock()->now();
-                out.header.frame_id = "map";
+                out.header.frame_id = this->world_frame;
+                out.child_frame_id = this->body_frame;
 
                 // Pose/Attitude
                 Eigen::Vector3d pos = in.p.cast<double>();
