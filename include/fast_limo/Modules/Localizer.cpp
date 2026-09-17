@@ -899,13 +899,18 @@
                                                 boost::circular_buffer<State>::reverse_iterator& begin_prop_it,
                                                 boost::circular_buffer<State>::reverse_iterator& end_prop_it) {
 
+            std::unique_lock<decltype(this->mtx_prop)> lock(this->mtx_prop);
             if (this->propagated_buffer.empty() || this->propagated_buffer.front().time < end_time) {
                 // Wait for the latest IMU data
                 std::cout << "PROPAGATE WAITING...\n";
-                std::cout << "     - buffer time: " << std::setprecision(15) << propagated_buffer.front().time << std::endl;
+                if (!this->propagated_buffer.empty())
+                    std::cout << "     - buffer time: " << std::setprecision(17) << propagated_buffer.front().time << std::endl;
+                else
+                    std::cout << "     - buffer is empty\n";
                 std::cout << "     - end scan time: " << std::setprecision(15) << end_time << std::endl;
-                std::unique_lock<decltype(this->mtx_prop)> lock(this->mtx_prop);
-                this->cv_prop_stamp.wait(lock, [this, &end_time]{ return this->propagated_buffer.front().time >= end_time; });
+                this->cv_prop_stamp.wait(lock, [this, &end_time]{
+                    return !this->propagated_buffer.empty() && this->propagated_buffer.front().time >= end_time;
+                });
             }
 
             auto prop_it = this->propagated_buffer.begin();
@@ -923,6 +928,14 @@
 
             if (prop_it == this->propagated_buffer.end()) {
                 // not enough IMU measurements, return false
+                std::cout << std::setprecision(17)
+                          << "FAST_LIMO::IMU coverage failure:\n"
+                          << "     - requested start/end: " << start_time << " / " << end_time << '\n'
+                          << "     - buffer oldest/newest: " << this->propagated_buffer.back().time
+                          << " / " << this->propagated_buffer.front().time << '\n'
+                          << "     - buffered states: " << this->propagated_buffer.size() << '\n'
+                          << "     - oldest minus requested start [s]: "
+                          << this->propagated_buffer.back().time - start_time << std::endl;
                 return false;
             }
             prop_it++;
