@@ -77,10 +77,12 @@ namespace ros2wrap {
                     imu_opt.callback_group = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
                     // Set up subscribers
+		    auto sensor_qos = rclcpp::SensorDataQoS();
+
                     lidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                                    config.topics.lidar, 1, std::bind(&LimoWrapper::lidar_callback, this, std::placeholders::_1), lidar_opt);
+                                    config.topics.lidar, sensor_qos, std::bind(&LimoWrapper::lidar_callback, this, std::placeholders::_1), lidar_opt);
                     imu_sub_   = this->create_subscription<sensor_msgs::msg::Imu>(
-                                    config.topics.imu, 1000, std::bind(&LimoWrapper::imu_callback, this, std::placeholders::_1), imu_opt);
+                                    config.topics.imu, sensor_qos, std::bind(&LimoWrapper::imu_callback, this, std::placeholders::_1), imu_opt);
                     
                     // Set up publishers
                     pc_pub      = this->create_publisher<sensor_msgs::msg::PointCloud2>("fast_limo/pointcloud", 1);
