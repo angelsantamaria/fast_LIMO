@@ -16,6 +16,8 @@
  */
 
 #include "ROSutils.hpp"
+#include "fast_limo/OutputGate.hpp"
+#include <std_msgs/msg/bool.hpp>
 
 namespace ros2wrap {
 
@@ -31,6 +33,11 @@ namespace ros2wrap {
             bool publish_tf;
 
         private:
+            fast_limo::OutputGate output_gate_;
+            double last_input_imu_stamp_ = 0.0;
+            rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr health_pub_;
+            rclcpp::TimerBase::SharedPtr health_timer_;
+
                 // subscribers
             rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
             rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr         imu_sub_;
@@ -100,6 +107,12 @@ namespace ros2wrap {
 
                     // Initialize Localizer
                     LOC.init(config);
+                    health_pub_ = create_publisher<std_msgs::msg::Bool>("fast_limo/localization_healthy", 1);
+                    health_timer_ = create_wall_timer(std::chrono::milliseconds(50), [this]() {
+                        std_msgs::msg::Bool health;
+                        health.data = output_ready();
+                        health_pub_->publish(health);
+                    });
                 }
             
             private:
@@ -107,6 +120,16 @@ namespace ros2wrap {
             /* ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
                ///////////////////////////////////////             Callbacks            ///////////////////////////////////////////////////////////// 
                ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// */
+
+            static double steady_seconds() {
+                return std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            }
+
+            bool output_ready() {
+                return output_gate_.ready(fast_limo::Localizer::getInstance().is_calibrated(),
+                                          get_clock()->now().seconds(), steady_seconds());
+            }
 
             void lidar_callback(const sensor_msgs::msg::PointCloud2 & msg) {
                 
@@ -120,37 +143,44 @@ namespace ros2wrap {
                 pcl::PointCloud<PointType>::Ptr pc_ (std::make_shared<pcl::PointCloud<PointType>>());
                 pcl::fromROSMsg(msg, *pc_);
 
-                loc.updatePointCloud(pc_, rclcpp::Time(msg.header.stamp).seconds());
+                const bool corrected = loc.updatePointCloud(pc_, rclcpp::Time(msg.header.stamp).seconds());
+                output_gate_.record(corrected, loc.get_scan_stamp(), steady_seconds());
+                if (!output_ready()) {
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                        "Localization output withheld: waiting for calibrated IMU and 3 consecutive "
+                        "LiDAR corrections (>=6 matches), with timestamps within 0.5 s");
+                    return;
+                }
 
                 // Publish output pointcloud
                 sensor_msgs::msg::PointCloud2 pc_ros;
                 pcl::toROSMsg(*loc.get_pointcloud(), pc_ros);
-                pc_ros.header.stamp = this->get_clock()->now();
+                pc_ros.header.stamp = rclcpp::Time(static_cast<int64_t>(loc.get_scan_stamp() * 1e9));
                 pc_ros.header.frame_id = this->world_frame;
                 this->pc_pub->publish(pc_ros);
 
                 // Publish debugging pointclouds
                 sensor_msgs::msg::PointCloud2 orig_msg;
                 pcl::toROSMsg(*loc.get_orig_pointcloud(), orig_msg);
-                orig_msg.header.stamp = this->get_clock()->now();
+                orig_msg.header.stamp = pc_ros.header.stamp;
                 orig_msg.header.frame_id = this->body_frame;
                 this->orig_pub->publish(orig_msg);
 
                 sensor_msgs::msg::PointCloud2 deskewed_msg;
                 pcl::toROSMsg(*loc.get_deskewed_pointcloud(), deskewed_msg);
-                deskewed_msg.header.stamp = this->get_clock()->now();
+                deskewed_msg.header.stamp = pc_ros.header.stamp;
                 deskewed_msg.header.frame_id = this->world_frame;
                 this->desk_pub->publish(deskewed_msg);
 
                 sensor_msgs::msg::PointCloud2 match_msg;
                 pcl::toROSMsg(*loc.get_pc2match_pointcloud(), match_msg);
-                match_msg.header.stamp = this->get_clock()->now();
+                match_msg.header.stamp = pc_ros.header.stamp;
                 match_msg.header.frame_id = this->body_frame;
                 this->match_pub->publish(match_msg);
 
                 sensor_msgs::msg::PointCloud2 finalraw_msg;
                 pcl::toROSMsg(*loc.get_finalraw_pointcloud(), finalraw_msg);
-                finalraw_msg.header.stamp = this->get_clock()->now();
+                finalraw_msg.header.stamp = pc_ros.header.stamp;
                 finalraw_msg.header.frame_id = this->world_frame;
                 this->finalraw_pub->publish(finalraw_msg);
 
@@ -168,8 +198,20 @@ namespace ros2wrap {
                 fast_limo::IMUmeas imu;
                 this->fromROStoLimo(msg, imu);
 
+                const double age = get_clock()->now().seconds() - imu.stamp;
+                if (!std::isfinite(imu.stamp) || imu.stamp <= last_input_imu_stamp_ ||
+                    age < -0.05 || age > fast_limo::OutputGate::timeout ||
+                    !imu.lin_accel.allFinite() || !imu.ang_vel.allFinite()) {
+                    output_gate_.record(false, 0.0, steady_seconds());
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                        "Rejecting invalid, stale or non-increasing IMU input; localization withheld");
+                    return;
+                }
+                last_input_imu_stamp_ = imu.stamp;
+
                 // Propagate IMU measurement
                 loc.updateIMU(imu);
+                if (!output_ready()) return;
 
                 // State publishing
                 nav_msgs::msg::Odometry state_msg, body_msg;
@@ -181,7 +223,7 @@ namespace ros2wrap {
 
                 // TF broadcasting
                 if(this->publish_tf)
-                    this->broadcastTF(loc.getWorldState(), world_frame, body_frame, true);
+                    this->broadcastTF(loc.getWorldState(), world_frame, body_frame, false);
             }
 
         /* ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
@@ -349,7 +391,7 @@ namespace ros2wrap {
             }
 
             void fromLimoToROS(const fast_limo::State& in, nav_msgs::msg::Odometry& out){
-                out.header.stamp = this->get_clock()->now();
+                out.header.stamp = rclcpp::Time(static_cast<int64_t>(in.time * 1e9));
                 out.header.frame_id = this->world_frame;
                 out.child_frame_id = this->body_frame;
 
@@ -392,11 +434,8 @@ namespace ros2wrap {
             void broadcastTF(const fast_limo::State& in, std::string parent_name, std::string child_name, bool now){
 
                 geometry_msgs::msg::TransformStamped tf_msg;
-                tf_msg.header.stamp    = (now) ? this->get_clock()->now() : rclcpp::Time(in.time);
-                /* NOTE: depending on IMU sensor rate, the state's stamp could be too old, 
-                    so a TF warning could be print out (really annoying!).
-                    In order to avoid this, the "now" argument should be true.
-                */
+                tf_msg.header.stamp    = (now) ? this->get_clock()->now() : rclcpp::Time(static_cast<int64_t>(in.time * 1e9));
+                // Preserve acquisition time; the output gate rejects stale localization.
                 tf_msg.header.frame_id = parent_name;
                 tf_msg.child_frame_id  = child_name;
 

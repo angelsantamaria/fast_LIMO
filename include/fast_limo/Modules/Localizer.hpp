@@ -18,6 +18,7 @@
 #ifndef __FASTLIMO_LOCALIZER_HPP__
 #define __FASTLIMO_LOCALIZER_HPP__
 
+#include <atomic>
 #include "fast_limo/Common.hpp"
 #include "fast_limo/Modules/Mapper.hpp"
 #include "fast_limo/Objects/State.hpp"
@@ -77,7 +78,8 @@ class fast_limo::Localizer {
         double gravity_;
 
         // Flags
-        bool imu_calibrated_;
+        std::atomic<bool> imu_calibrated_;
+        int last_match_count_ = 0; // Only accessed in the serialized LiDAR update.
 
         // OpenMP max threads
         int num_threads_;
@@ -141,7 +143,7 @@ class fast_limo::Localizer {
 
         // Callbacks 
         void updateIMU(IMUmeas& raw_imu);
-        void updatePointCloud(pcl::PointCloud<PointType>::Ptr& raw_pc, double time_stamp);
+        bool updatePointCloud(pcl::PointCloud<PointType>::Ptr& raw_pc, double time_stamp);
 
         // Get output
         pcl::PointCloud<PointType>::Ptr get_pointcloud();
@@ -167,6 +169,7 @@ class fast_limo::Localizer {
 
         // Status info
         bool is_calibrated();
+        double get_scan_stamp() const { return scan_stamp; }
 
         // Config
         void set_sensor_type(uint8_t type);

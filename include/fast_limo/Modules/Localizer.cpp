@@ -156,6 +156,7 @@
         }
 
         State Localizer::getBodyState(){
+            std::lock_guard<std::mutex> lock(this->mtx_ikfom);
 
             if(not this->is_calibrated())
                 return State();
@@ -173,6 +174,7 @@
         }
 
         State Localizer::getWorldState(){
+            std::lock_guard<std::mutex> lock(this->mtx_ikfom);
 
             if(not this->is_calibrated())
                 return State();
@@ -207,6 +209,7 @@
         }
 
         std::vector<double> Localizer::getPoseCovariance(){
+            std::lock_guard<std::mutex> lock(this->mtx_ikfom);
             if(not this->is_calibrated())
                 return std::vector<double>(36, 0);
 
@@ -224,6 +227,7 @@
         }
 
         std::vector<double> Localizer::getTwistCovariance(){
+            std::lock_guard<std::mutex> lock(this->mtx_ikfom);
             if(not this->is_calibrated())
                 return std::vector<double>(36, 0);
 
@@ -242,21 +246,22 @@
         /////////////////////////////////           Principal callbacks/threads        /////////////////////////////////////////////////
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-        void Localizer::updatePointCloud(pcl::PointCloud<PointType>::Ptr& raw_pc, double time_stamp){
+        bool Localizer::updatePointCloud(pcl::PointCloud<PointType>::Ptr& raw_pc, double time_stamp){
 
+            bool corrected = false;
             auto start_time = std::chrono::system_clock::now();
 
             if(raw_pc->points.size() < 1){
                 std::cout << "FAST_LIMO::Raw PointCloud is empty!\n";
-                return;
+                return false;
             }
 
             if(!this->imu_calibrated_)
-                return;
+                return false;
 
             if(this->imu_buffer.empty()){
                 std::cout << "FAST_LIMO::IMU buffer is empty!\n";
-                return;
+                return false;
             }
 
             // Remove NaNs
@@ -330,6 +335,7 @@
 
                     // Update iKFoM measurements (after prediction)
                 double solve_time = 0.0;
+                last_match_count_ = 0;
                 this->_iKFoM.update_iterated_dyn_share_modified(0.001 /*LiDAR noise*/, 5.0/*Degeneracy threshold*/, 
                                                                 solve_time/*solving time elapsed*/, false/*print degeneracy values flag*/);
                     /*NOTE: update_iterated_dyn_share_modified() will trigger the matching procedure ( see "use-ikfom.cpp" )
@@ -347,6 +353,8 @@
 
                 // Update current state estimate
                 this->state      = corrected_state;
+                corrected = last_match_count_ >= 6 && corrected_state.p.allFinite() &&
+                    corrected_state.v.allFinite() && corrected_state.q.coeffs().allFinite();
                 this->state.w    = this->last_imu.ang_vel;
                 this->state.a    = this->last_imu.lin_accel;
 
@@ -416,6 +424,7 @@
             this->debug_thread.detach();
 
             this->prev_scan_stamp = this->scan_stamp;
+            return corrected;
         }
 
         void Localizer::updateIMU(IMUmeas& raw_imu){
@@ -557,6 +566,7 @@
             
             int N = (matches.size() > config.ikfom.mapping.MAX_NUM_MATCHES) ? config.ikfom.mapping.MAX_NUM_MATCHES : matches.size();
 
+            last_match_count_ = N;
             H = Eigen::MatrixXd::Zero(N, 12);
             h.resize(N);
             State S(s);
@@ -908,9 +918,12 @@
                 else
                     std::cout << "     - buffer is empty\n";
                 std::cout << "     - end scan time: " << std::setprecision(15) << end_time << std::endl;
-                this->cv_prop_stamp.wait(lock, [this, &end_time]{
+                if (!this->cv_prop_stamp.wait_for(lock, std::chrono::milliseconds(200), [this, &end_time]{
                     return !this->propagated_buffer.empty() && this->propagated_buffer.front().time >= end_time;
-                });
+                })) {
+                    std::cout << "FAST_LIMO::IMU coverage wait timed out; rejecting scan\n";
+                    return false;
+                }
             }
 
             auto prop_it = this->propagated_buffer.begin();

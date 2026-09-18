@@ -34,6 +34,7 @@ find_package(Threads REQUIRED)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -86,7 +87,7 @@ target_link_libraries(${PROJECT_NAME} ${PCL_LIBRARIES} ${OpenMP_LIBS} ikfom)
 add_executable(${PROJECT_NAME}_multi_exec
               src/LimoWrapper.cpp
               )
-ament_target_dependencies(${PROJECT_NAME}_multi_exec rclcpp sensor_msgs geometry_msgs visualization_msgs nav_msgs tf2 tf2_ros pcl_conversions)
+ament_target_dependencies(${PROJECT_NAME}_multi_exec rclcpp std_msgs sensor_msgs geometry_msgs visualization_msgs nav_msgs tf2 tf2_ros pcl_conversions)
 target_link_libraries(${PROJECT_NAME}_multi_exec ${PROJECT_NAME} ${PCL_LIBRARIES})
 
 # Binaries
@@ -100,5 +101,14 @@ install(DIRECTORY
   config
   DESTINATION share/${PROJECT_NAME}/
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(ros_output_gate test/test_ros_output_gate.py TIMEOUT 30)
+  enable_testing()
+  add_executable(output_gate_test test/output_gate_test.cpp)
+  target_link_libraries(output_gate_test Threads::Threads)
+  add_test(NAME output_gate_test COMMAND output_gate_test)
+endif()
 
 ament_package()
