@@ -18,6 +18,9 @@
 #include "ROSutils.hpp"
 #include "fast_limo/OutputGate.hpp"
 #include "fast_limo/StartupGate.hpp"
+#include "fast_limo/StationaryGate.hpp"
+#include <unistd.h>
+#include <cstdlib>
 #include <std_msgs/msg/bool.hpp>
 
 namespace ros2wrap {
@@ -32,12 +35,19 @@ namespace ros2wrap {
             std::string body_frame;
 
             bool publish_tf;
+            std::atomic<bool> restart_requested{false};
+            std::atomic<bool> startup_failed{false};
 
         private:
             fast_limo::OutputGate output_gate_;
             fast_limo::StartupGate startup_gate_;
             std::mutex startup_mutex_;
             bool startup_enabled_ = false;
+            bool validation_enabled_ = false;
+            int max_retries_ = 3;
+            fast_limo::StationaryGate stationary_gate_;
+            std::mutex validation_mutex_;
+            std::atomic<bool> validated_{false};
             bool end_of_sweep_ = false;
             double last_input_imu_stamp_ = 0.0;
             rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr health_pub_;
@@ -84,6 +94,15 @@ namespace ros2wrap {
                         if (!has_parameter(name)) declare_parameter(name, fallback);
                         return get_parameter(name);
                     };
+                    validation_enabled_ = parameter("calibration.validate_stationary", false).as_bool();
+                    stationary_gate_.duration = parameter("calibration.validation_time_sec", 5.0).as_double();
+                    stationary_gate_.translation = parameter("calibration.max_initial_translation_m", 0.15).as_double();
+                    stationary_gate_.rotation = parameter("calibration.max_initial_rotation_deg", 3.0).as_double() * M_PI / 180.0;
+                    max_retries_ = parameter("calibration.max_startup_retries", 3).as_int();
+                    if (!std::isfinite(stationary_gate_.duration) || stationary_gate_.duration <= 0 ||
+                        !std::isfinite(stationary_gate_.translation) || stationary_gate_.translation <= 0 ||
+                        !std::isfinite(stationary_gate_.rotation) || stationary_gate_.rotation <= 0 || max_retries_ < 0)
+                        throw std::runtime_error("Invalid stationary validation thresholds");
                     startup_enabled_ = parameter("calibration.freshness_gate", false).as_bool();
                     startup_gate_.max_age = parameter("calibration.max_sensor_delay_sec", 0.1).as_double();
                     startup_gate_.settle_time = parameter("calibration.settle_time_sec", 2.0).as_double();
@@ -128,8 +147,10 @@ namespace ros2wrap {
                     health_pub_ = create_publisher<std_msgs::msg::Bool>("fast_limo/localization_healthy", 1);
                     health_timer_ = create_wall_timer(std::chrono::milliseconds(50), [this]() {
                         std_msgs::msg::Bool health;
+                        validate_startup();
                         health.data = output_ready();
                         health_pub_->publish(health);
+                        if (startup_failed) rclcpp::shutdown();
                     });
                 }
             
@@ -144,7 +165,34 @@ namespace ros2wrap {
                     std::chrono::steady_clock::now().time_since_epoch()).count();
             }
 
+            void validate_startup() {
+                if (!validation_enabled_ || validated_ || startup_failed) return;
+                auto& loc = fast_limo::Localizer::getInstance();
+                if (!loc.is_calibrated()) return;
+                std::lock_guard<std::mutex> lock(validation_mutex_);
+                if (validated_ || startup_failed) return;
+                const auto state = loc.getWorldState();
+                stationary_gate_.observe(steady_seconds(), state.p, state.q,
+                    output_gate_.ready(true, get_clock()->now().seconds(), steady_seconds()));
+                if (stationary_gate_.failed) {
+                    startup_failed = true;
+                    const char* retry = std::getenv("FAST_LIMO_STARTUP_RETRY");
+                    const int attempt = retry ? std::atoi(retry) : 0;
+                    restart_requested = attempt < max_retries_;
+                    RCLCPP_ERROR(get_logger(), "Stationary startup validation failed (position norm %.3f m). %s; retry %d/%d",
+                        state.p.norm(), restart_requested ? "Restarting clean estimator" : "Retry limit reached",
+                        attempt, max_retries_);
+                } else if (stationary_gate_.passed) {
+                    validated_ = true;
+                    RCLCPP_INFO(get_logger(), "Stationary startup validation passed; releasing localization");
+                } else {
+                    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                        "Validating stationary startup; keep robot still, localization withheld");
+                }
+            }
+
             bool output_ready() {
+                if (startup_failed || (validation_enabled_ && !validated_)) return false;
                 return output_gate_.ready(fast_limo::Localizer::getInstance().is_calibrated(),
                                           get_clock()->now().seconds(), steady_seconds());
             }
@@ -184,6 +232,7 @@ namespace ros2wrap {
 
                 const bool corrected = loc.updatePointCloud(pc_, rclcpp::Time(msg.header.stamp).seconds());
                 output_gate_.record(corrected, loc.get_scan_stamp(), steady_seconds());
+                validate_startup();
                 if (!output_ready()) {
                     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
                         "Localization output withheld: waiting for calibrated IMU and 3 consecutive "
@@ -249,6 +298,7 @@ namespace ros2wrap {
                         return;
                     }
                     loc.updateIMU(imu);
+                    validate_startup();
                     return;
                 }
                 startup_lock.unlock();
@@ -265,6 +315,7 @@ namespace ros2wrap {
 
                 // Propagate IMU measurement
                 loc.updateIMU(imu);
+                validate_startup();
                 if (!output_ready()) return;
 
                 // State publishing
@@ -618,12 +669,22 @@ int main(int argc, char * argv[])
 {
     rclcpp::init(argc, argv);
 
-    rclcpp::Node::SharedPtr limo = std::make_shared<ros2wrap::LimoWrapper>();
+    auto limo = std::make_shared<ros2wrap::LimoWrapper>();
 
     rclcpp::executors::MultiThreadedExecutor executor; // by default using all available cores
     executor.add_node(limo);
     executor.spin();
 
-    rclcpp::shutdown();
-    return 0;
+    if (rclcpp::ok()) rclcpp::shutdown();
+    if (limo->restart_requested) {
+        const char* previous = std::getenv("FAST_LIMO_STARTUP_RETRY");
+        const std::string next = std::to_string((previous ? std::atoi(previous) : 0) + 1);
+        setenv("FAST_LIMO_STARTUP_RETRY", next.c_str(), 1);
+        // Replace the entire process image: clears singleton map/filter, static
+        // calibration state, queues and DDS participants while preserving launch PID.
+        execv("/proc/self/exe", argv);
+        perror("FAST-LIMO restart failed");
+        return 1;
+    }
+    return limo->startup_failed ? 1 : 0;
 }

@@ -18,8 +18,8 @@ from std_msgs.msg import Bool
 from tf2_msgs.msg import TFMessage
 
 
-@pytest.mark.parametrize('freshness_gate', [False, True])
-def test_imu_only_is_withheld(freshness_gate):
+@pytest.mark.parametrize('freshness_gate,validation', [(False, False), (True, False), (False, True)])
+def test_imu_only_is_withheld(freshness_gate, validation):
     rclpy.init()
     node = Node('output_gate_test')
     imu_pub = node.create_publisher(Imu, '/ouster/imu', 10)
@@ -35,10 +35,12 @@ def test_imu_only_is_withheld(freshness_gate):
     process = subprocess.Popen(
         [str(executable), '--ros-args', '--params-file', str(config),
          '-p', 'calibration.time:=0.15',
-         '-p', f'calibration.freshness_gate:={str(freshness_gate).lower()}', '-p', 'verbose:=false', '-p', 'debug:=false'],
+         '-p', f'calibration.freshness_gate:={str(freshness_gate).lower()}',
+         '-p', f'calibration.validate_stationary:={str(validation).lower()}',
+         '-p', 'calibration.max_startup_retries:=1', '-p', 'verbose:=false', '-p', 'debug:=false'],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
-        deadline = time.monotonic() + 2.5
+        deadline = time.monotonic() + (8.0 if validation else 2.5)
         while time.monotonic() < deadline:
             msg = Imu()
             msg.header.stamp = node.get_clock().now().to_msg()
@@ -47,7 +49,7 @@ def test_imu_only_is_withheld(freshness_gate):
             imu_pub.publish(msg)
             rclpy.spin_once(node, timeout_sec=0.01)
             time.sleep(0.005)
-        assert process.poll() is None
+        assert process.poll() == (1 if validation else None)
         assert health and all(not msg.data for msg in health)
         assert not poses and not transforms
     finally:
@@ -64,3 +66,7 @@ def test_imu_only_is_withheld(freshness_gate):
     assert ('Estimated initial attitude' in output) == (not freshness_gate), output
     if freshness_gate:
         assert 'Waiting for fresh sensors' in output, output
+
+    if validation:
+        assert output.count('Estimated initial attitude') == 2, output
+        assert 'Retry limit reached' in output, output
