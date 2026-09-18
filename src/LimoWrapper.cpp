@@ -17,6 +17,7 @@
 
 #include "ROSutils.hpp"
 #include "fast_limo/OutputGate.hpp"
+#include "fast_limo/StartupGate.hpp"
 #include <std_msgs/msg/bool.hpp>
 
 namespace ros2wrap {
@@ -34,6 +35,10 @@ namespace ros2wrap {
 
         private:
             fast_limo::OutputGate output_gate_;
+            fast_limo::StartupGate startup_gate_;
+            std::mutex startup_mutex_;
+            bool startup_enabled_ = false;
+            bool end_of_sweep_ = false;
             double last_input_imu_stamp_ = 0.0;
             rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr health_pub_;
             rclcpp::TimerBase::SharedPtr health_timer_;
@@ -74,6 +79,19 @@ namespace ros2wrap {
                     // Load config
                     fast_limo::Config config;
                     this->loadConfig(&config);
+                    end_of_sweep_ = config.end_of_sweep;
+                    auto parameter = [this](const std::string& name, auto fallback) {
+                        if (!has_parameter(name)) declare_parameter(name, fallback);
+                        return get_parameter(name);
+                    };
+                    startup_enabled_ = parameter("calibration.freshness_gate", false).as_bool();
+                    startup_gate_.max_age = parameter("calibration.max_sensor_delay_sec", 0.1).as_double();
+                    startup_gate_.settle_time = parameter("calibration.settle_time_sec", 2.0).as_double();
+                    startup_gate_.max_gap = parameter("calibration.max_sensor_gap_sec", 0.25).as_double();
+                    if (!std::isfinite(startup_gate_.max_age) || startup_gate_.max_age <= 0 ||
+                        !std::isfinite(startup_gate_.settle_time) || startup_gate_.settle_time < 0 ||
+                        !std::isfinite(startup_gate_.max_gap) || startup_gate_.max_gap <= 0)
+                        throw std::runtime_error("Invalid calibration freshness thresholds");
 
                     rclcpp::Parameter tf_pub = this->get_parameter("frames.tf_pub");
                     this->publish_tf = tf_pub.as_bool();
@@ -143,6 +161,27 @@ namespace ros2wrap {
                 pcl::PointCloud<PointType>::Ptr pc_ (std::make_shared<pcl::PointCloud<PointType>>());
                 pcl::fromROSMsg(msg, *pc_);
 
+                if (startup_enabled_) {
+                    std::lock_guard<std::mutex> lock(startup_mutex_);
+                    if (!loc.is_calibrated()) {
+                        double end = -INFINITY;
+                        const double header = rclcpp::Time(msg.header.stamp).seconds();
+                        for (const auto& point : pc_->points) {
+                            double stamp = point.timestamp;
+                            const auto sensor = loc.get_sensor_type();
+                            const double sign = end_of_sweep_ ? -1.0 : 1.0;
+                            if (sensor == fast_limo::SensorType::OUSTER) stamp = header + sign * point.t * 1e-9;
+                            else if (sensor == fast_limo::SensorType::VELODYNE) stamp = header + sign * point.time;
+                            else if (sensor == fast_limo::SensorType::LIVOX) stamp = header + sign * point.timestamp * 1e-9;
+                            if (!std::isfinite(stamp)) { end = NAN; break; }
+                            end = std::max(end, stamp);
+                        }
+                        startup_gate_.observe(0, end, get_clock()->now().seconds(), steady_seconds());
+                        if (!startup_gate_.ready(steady_seconds())) loc.reset_initial_calibration();
+                        return; // Never queue scans from settling or partial calibration.
+                    }
+                }
+
                 const bool corrected = loc.updatePointCloud(pc_, rclcpp::Time(msg.header.stamp).seconds());
                 output_gate_.record(corrected, loc.get_scan_stamp(), steady_seconds());
                 if (!output_ready()) {
@@ -198,6 +237,21 @@ namespace ros2wrap {
                 fast_limo::IMUmeas imu;
                 this->fromROStoLimo(msg, imu);
 
+                std::unique_lock<std::mutex> startup_lock(startup_mutex_);
+                if (startup_enabled_ && !loc.is_calibrated()) {
+                    const double stamp = imu.lin_accel.allFinite() && imu.ang_vel.allFinite() ? imu.stamp : NAN;
+                    startup_gate_.observe(1, stamp, get_clock()->now().seconds(), steady_seconds());
+                    if (!startup_gate_.ready(steady_seconds())) {
+                        loc.reset_initial_calibration();
+                        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                            "Waiting for fresh sensors before IMU calibration: lidar age %.3f s, IMU age %.3f s; keep robot stationary",
+                            startup_gate_.ages[0], startup_gate_.ages[1]);
+                        return;
+                    }
+                    loc.updateIMU(imu);
+                    return;
+                }
+                startup_lock.unlock();
                 const double age = get_clock()->now().seconds() - imu.stamp;
                 if (!std::isfinite(imu.stamp) || imu.stamp <= last_input_imu_stamp_ ||
                     age < -0.05 || age > fast_limo::OutputGate::timeout ||

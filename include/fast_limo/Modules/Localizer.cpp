@@ -427,6 +427,16 @@
             return corrected;
         }
 
+        void Localizer::reset_initial_calibration() {
+            if (imu_calibrated_) return;
+            first_imu_stamp = prev_imu_stamp = imu_stamp = 0.0;
+            num_samples = 0;
+            gyro_avg.setZero();
+            accel_avg.setZero();
+            print = true;
+            have_previous_gyro = false;
+        }
+
         void Localizer::updateIMU(IMUmeas& raw_imu){
 
             this->imu_stamp = raw_imu.stamp;
@@ -439,11 +449,6 @@
 
             // IMU calibration procedure - do only while the robot is in stand still!
             if (not this->imu_calibrated_) {
-
-                static int num_samples = 0;
-                static Eigen::Vector3f gyro_avg (0., 0., 0.);
-                static Eigen::Vector3f accel_avg (0., 0., 0.);
-                static bool print = true;
 
                 if ((imu.stamp - this->first_imu_stamp) < this->imu_calib_time_) {
 
@@ -733,7 +738,10 @@
             // Transform angular velocity (will be the same on a rigid body, so just rotate to baselink frame)
             Eigen::Vector3f ang_vel_cg = this->extr.imu2baselink.R * imu.ang_vel;
 
-            static Eigen::Vector3f ang_vel_cg_prev = ang_vel_cg;
+            if (!have_previous_gyro) {
+                ang_vel_cg_prev = ang_vel_cg;
+                have_previous_gyro = true;
+            }
 
             // Transform linear acceleration (need to account for component due to translational difference)
             Eigen::Vector3f lin_accel_cg = this->extr.imu2baselink.R * imu.lin_accel;

@@ -9,6 +9,7 @@ os.environ['ROS_DOMAIN_ID'] = '198'
 os.environ['ROS_AUTOMATIC_DISCOVERY_RANGE'] = 'LOCALHOST'
 
 from ament_index_python.packages import get_package_prefix
+import pytest
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
@@ -17,7 +18,8 @@ from std_msgs.msg import Bool
 from tf2_msgs.msg import TFMessage
 
 
-def test_imu_only_is_withheld():
+@pytest.mark.parametrize('freshness_gate', [False, True])
+def test_imu_only_is_withheld(freshness_gate):
     rclpy.init()
     node = Node('output_gate_test')
     imu_pub = node.create_publisher(Imu, '/ouster/imu', 10)
@@ -32,7 +34,8 @@ def test_imu_only_is_withheld():
     config = Path(__file__).parents[1] / 'config/params.yaml'
     process = subprocess.Popen(
         [str(executable), '--ros-args', '--params-file', str(config),
-         '-p', 'calibration.time:=0.15', '-p', 'verbose:=false', '-p', 'debug:=false'],
+         '-p', 'calibration.time:=0.15',
+         '-p', f'calibration.freshness_gate:={str(freshness_gate).lower()}', '-p', 'verbose:=false', '-p', 'debug:=false'],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         deadline = time.monotonic() + 2.5
@@ -58,4 +61,6 @@ def test_imu_only_is_withheld():
         del subscriptions
         node.destroy_node()
         rclpy.shutdown()
-    assert 'Estimated initial attitude' in output, output
+    assert ('Estimated initial attitude' in output) == (not freshness_gate), output
+    if freshness_gate:
+        assert 'Waiting for fresh sensors' in output, output

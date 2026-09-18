@@ -73,6 +73,12 @@ class fast_limo::Localizer {
         double first_imu_stamp;
         double last_propagate_time_;
         double imu_calib_time_;
+        int num_samples = 0;
+        Eigen::Vector3f gyro_avg = Eigen::Vector3f::Zero();
+        Eigen::Vector3f accel_avg = Eigen::Vector3f::Zero();
+        bool print = true;
+        Eigen::Vector3f ang_vel_cg_prev = Eigen::Vector3f::Zero();
+        bool have_previous_gyro = false;
 
         // Gravity
         double gravity_;
@@ -169,6 +175,7 @@ class fast_limo::Localizer {
 
         // Status info
         bool is_calibrated();
+        void reset_initial_calibration();
         double get_scan_stamp() const { return scan_stamp; }
 
         // Config
